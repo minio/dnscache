@@ -23,29 +23,14 @@ type Resolver struct {
 	// net.DefaultResolver is used instead.
 	Resolver DNSResolver
 
-	// Duration for errors to be cached
-	// Default is 1s
-	CacheFailDuration time.Duration
-
 	once  sync.Once
 	mu    sync.RWMutex
 	cache map[string]*cacheEntry
-
-	// OnCacheMiss is executed if the host or address is not included in
-	// the cache and the default lookup is executed.
-	OnCacheMiss func()
-}
-
-type ResolverRefreshOptions struct {
-	ClearUnused      bool
-	PersistOnFailure bool
 }
 
 type cacheEntry struct {
-	rrs     []string
-	err     error
-	used    bool
-	created time.Time
+	rrs  []string
+	used bool
 }
 
 // LookupAddr performs a reverse lookup for the given address, returning a list
@@ -63,10 +48,8 @@ func (r *Resolver) LookupHost(ctx context.Context, host string) (addrs []string,
 }
 
 // refreshRecords refreshes cached entries which have been used at least once since
-// the last Refresh. If clearUnused is true, entries which haven't be used since the
-// last Refresh are removed from the cache. If persistOnFailure is true, stale
-// entries will not be removed on failed lookups
-func (r *Resolver) refreshRecords(clearUnused bool, persistOnFailure bool) {
+// the last Refresh.
+func (r *Resolver) refreshRecords() {
 	r.once.Do(r.init)
 	r.mu.RLock()
 	update := make([]string, 0, len(r.cache))
@@ -74,7 +57,7 @@ func (r *Resolver) refreshRecords(clearUnused bool, persistOnFailure bool) {
 	for key, entry := range r.cache {
 		if entry.used {
 			update = append(update, key)
-		} else if clearUnused {
+		} else {
 			del = append(del, key)
 		}
 	}
@@ -89,24 +72,16 @@ func (r *Resolver) refreshRecords(clearUnused bool, persistOnFailure bool) {
 	}
 
 	for _, key := range update {
-		r.update(context.Background(), key, false, persistOnFailure)
+		r.update(context.Background(), key, false)
 	}
 }
 
-func (r *Resolver) Refresh(clearUnused bool) {
-	r.refreshRecords(clearUnused, false)
-}
-
-func (r *Resolver) RefreshWithOptions(options ResolverRefreshOptions) {
-	r.refreshRecords(options.ClearUnused, options.PersistOnFailure)
+func (r *Resolver) Refresh() {
+	r.refreshRecords()
 }
 
 func (r *Resolver) init() {
 	r.cache = make(map[string]*cacheEntry)
-
-	if r.CacheFailDuration == 0 {
-		r.CacheFailDuration = 1 * time.Second
-	}
 }
 
 // lookupGroup merges lookup calls together for lookups for the same host. The
@@ -115,17 +90,14 @@ var lookupGroup singleflight.Group
 
 func (r *Resolver) lookup(ctx context.Context, key string) (rrs []string, err error) {
 	var found bool
-	rrs, err, found = r.load(key)
+	rrs, found = r.load(key)
 	if !found {
-		if r.OnCacheMiss != nil {
-			r.OnCacheMiss()
-		}
-		rrs, err = r.update(ctx, key, true, false)
+		rrs, err = r.update(ctx, key, true)
 	}
 	return
 }
 
-func (r *Resolver) update(ctx context.Context, key string, used bool, persistOnFailure bool) (rrs []string, err error) {
+func (r *Resolver) update(ctx context.Context, key string, used bool) (rrs []string, err error) {
 	c := lookupGroup.DoChan(key, r.lookupFunc(ctx, key))
 	select {
 	case <-ctx.Done():
@@ -141,26 +113,25 @@ func (r *Resolver) update(ctx context.Context, key string, used bool, persistOnF
 			// We had concurrent lookups, check if the cache is already updated
 			// by a friend.
 			var found bool
-			rrs, err, found = r.load(key)
+			rrs, found = r.load(key)
 			if found {
 				return
 			}
-		}
-		err = res.Err
-		if err == nil {
-			rrs, _ = res.Val.([]string)
 		}
 
-		if err != nil && persistOnFailure {
+		if res.Err != nil {
 			var found bool
-			rrs, err, found = r.load(key)
+			rrs, found = r.load(key)
 			if found {
 				return
 			}
+			return nil, res.Err
 		}
+
+		rrs, _ = res.Val.([]string)
 
 		r.mu.Lock()
-		r.storeLocked(key, rrs, used, err)
+		r.storeLocked(key, rrs, used)
 		r.mu.Unlock()
 	}
 	return
@@ -220,7 +191,7 @@ func (r *Resolver) prepareCtx(origContext context.Context) (ctx context.Context,
 	return
 }
 
-func (r *Resolver) load(key string) (rrs []string, err error, found bool) {
+func (r *Resolver) load(key string) (rrs []string, found bool) {
 	r.mu.RLock()
 	var entry *cacheEntry
 	entry, found = r.cache[key]
@@ -229,35 +200,28 @@ func (r *Resolver) load(key string) (rrs []string, err error, found bool) {
 		return
 	}
 	rrs = entry.rrs
-	err = entry.err
 	used := entry.used
 	r.mu.RUnlock()
-
-	if err != nil && time.Now().Sub(entry.created) > r.CacheFailDuration {
-		return []string{}, nil, false
-	}
 
 	if !used {
 		r.mu.Lock()
 		entry.used = true
+		r.cache[key] = entry
 		r.mu.Unlock()
 	}
-	return rrs, err, true
+	return rrs, true
 }
 
-func (r *Resolver) storeLocked(key string, rrs []string, used bool, err error) {
+func (r *Resolver) storeLocked(key string, rrs []string, used bool) {
 	if entry, found := r.cache[key]; found {
 		// Update existing entry in place
 		entry.rrs = rrs
-		entry.err = err
 		entry.used = used
 		return
 	}
 	r.cache[key] = &cacheEntry{
-		rrs:     rrs,
-		err:     err,
-		used:    used,
-		created: time.Now(),
+		rrs:  rrs,
+		used: used,
 	}
 }
 

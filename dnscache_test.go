@@ -116,6 +116,15 @@ func TestResolver_LookupHost_DNSHooksGetTriggerd(t *testing.T) {
 	}
 }
 
+func TestResolver_Remove(t *testing.T) {
+	r := &Resolver{}
+	_, _ = r.LookupHost(context.Background(), "google.com")
+	r.Remove("google.com")
+	if e := r.cache["hgoogle.com"]; e != nil {
+		t.Error("cache entry is not removed")
+	}
+}
+
 type fakeResolver struct {
 	LookupHostCalls int32
 	LookupAddrCalls int32

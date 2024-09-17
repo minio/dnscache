@@ -47,6 +47,14 @@ func (r *Resolver) LookupHost(ctx context.Context, host string) (addrs []string,
 	return r.lookup(ctx, "h"+host)
 }
 
+// Remove removes the entry for the given host from the cache.
+func (r *Resolver) Remove(host string) {
+	r.once.Do(r.init)
+	r.mu.Lock()
+	delete(r.cache, "h"+host)
+	r.mu.Unlock()
+}
+
 // refreshRecords refreshes cached entries which have been used at least once since
 // the last Refresh.
 func (r *Resolver) refreshRecords() {
